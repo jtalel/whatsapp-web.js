@@ -91,8 +91,24 @@ client.on('message', msg => {
 client.initialize();
 ```
 
-Take a look at [example.js][examples] for another examples with additional use cases.  
+Take a look at [example.js][examples] for another examples with additional use cases.
 For further details on saving and restoring sessions, explore the provided [Authentication Strategies][auth-strategies].
+
+### Envío masivo desde Excel
+
+El repositorio incluye `bulk-sender.js`, un script que lee un archivo Excel con las columnas `telefono` y `nombre` (o sus equivalentes en inglés) y envía mensajes personalizados a cada contacto respetando un retraso mínimo configurable entre envíos.
+
+```bash
+node bulk-sender.js ./ruta/al/archivo.xlsx 7000
+```
+
+- El segundo parámetro es opcional y define el retraso en milisegundos entre mensajes (por defecto `5000`).
+- Define variables de entorno para personalizar el comportamiento:
+  - `BULK_DEFAULT_COUNTRY_CODE`: Prefijo de país que se añadirá a los números que no lo incluyan.
+  - `BULK_MESSAGE_TEMPLATE`: Plantilla del mensaje; acepta `{name}` y `{phone}` como marcadores.
+  - `BULK_MIN_DELAY_MS`: Retraso mínimo entre mensajes si no se pasa como argumento.
+
+Los números se normalizan automáticamente (se eliminan espacios, signos `+`, `00` inicial y ceros a la izquierda) y se descartan los registros con menos de 8 dígitos después de la limpieza.
 
 
 ## Supported features
