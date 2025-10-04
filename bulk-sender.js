@@ -5,46 +5,55 @@ const XLSX = require('xlsx');
 const { Client, LocalAuth } = require('./index');
 
 const DEFAULT_MIN_DELAY = Number.parseInt(process.env.BULK_MIN_DELAY_MS, 10) || 5000;
-const DEFAULT_COUNTRY_CODE = process.env.BULK_DEFAULT_COUNTRY_CODE || '';
-const MESSAGE_TEMPLATE = process.env.BULK_MESSAGE_TEMPLATE || 'Hola {name}, este es un mensaje automatizado.';
+const VALIDATION_DELAY = Number.parseInt(process.env.BULK_VALIDATION_DELAY_MS, 10) || 2000;
+const MESSAGE_TEMPLATE_ENV = process.env.BULK_MESSAGE_TEMPLATE || 'Hola {name}, este es un mensaje automatizado.';
+const MESSAGE_FILE_ENV = process.env.BULK_MESSAGE_FILE;
+
+const VENEZUELA_COUNTRY_CODE = '58';
+const VENEZUELA_PREFIXES = ['412', '422', '416', '426', '414', '424'];
+
+let messageTemplate = MESSAGE_TEMPLATE_ENV;
 
 /**
- * Normalizes phone numbers to the WhatsApp format (<digits>@c.us).
- * Optionally prefixes a default country code when it is missing.
+ * Normalizes Venezuelan mobile phone numbers to the WhatsApp format (<digits>@c.us).
+ * Ensures they start with country code 58 and one of the accepted mobile prefixes.
  * @param {string|number} input
- * @param {string} defaultCountryCode
  * @returns {{id: string, display: string}|null}
  */
-function normalizePhoneNumber(input, defaultCountryCode = '') {
+function normalizePhoneNumber(input) {
     if (input === null || input === undefined) {
         return null;
     }
 
-    let digits = String(input).replace(/[^\d+]/g, '');
+    let digits = String(input).replace(/\D/g, '');
 
     if (!digits) {
         return null;
-    }
-
-    if (digits.startsWith('+')) {
-        digits = digits.slice(1);
     }
 
     if (digits.startsWith('00')) {
         digits = digits.slice(2);
     }
 
-    if (defaultCountryCode && !digits.startsWith(defaultCountryCode)) {
-        digits = `${defaultCountryCode}${digits.replace(/^0+/, '')}`;
+    digits = digits.replace(/^0+/, '');
+
+    if (digits.startsWith(VENEZUELA_COUNTRY_CODE)) {
+        digits = digits.slice(VENEZUELA_COUNTRY_CODE.length);
     }
 
-    if (digits.length < 8) {
+    if (!VENEZUELA_PREFIXES.some(prefix => digits.startsWith(prefix))) {
         return null;
     }
 
+    if (digits.length !== 10) {
+        return null;
+    }
+
+    const normalized = `${VENEZUELA_COUNTRY_CODE}${digits}`;
+
     return {
-        id: `${digits}@c.us`,
-        display: digits
+        id: `${normalized}@c.us`,
+        display: normalized
     };
 }
 
@@ -74,7 +83,7 @@ function readContactsFromWorkbook(workbookPath) {
             const telefono = row.telefono ?? row.phone ?? row.Telefono ?? row.Phone;
             const nombre = row.nombre ?? row.name ?? row.Nombre ?? row.Name;
 
-            const normalized = normalizePhoneNumber(telefono, DEFAULT_COUNTRY_CODE);
+            const normalized = normalizePhoneNumber(telefono);
 
             if (!normalized) {
                 console.warn(`Fila ${index + 2}: Número inválido u omitido. Se omite el contacto.`);
@@ -93,7 +102,7 @@ function readContactsFromWorkbook(workbookPath) {
 }
 
 function buildMessage(contact) {
-    return MESSAGE_TEMPLATE
+    return messageTemplate
         .replace(/\{name\}/g, contact.name)
         .replace(/\{phone\}/g, contact.phoneDisplay);
 }
@@ -117,6 +126,65 @@ async function sendBulkMessages(client, contacts, minDelayMs) {
     }
 }
 
+async function filterRegisteredContacts(client, contacts, validationDelayMs) {
+    const registered = [];
+
+    for (const contact of contacts) {
+        try {
+            const numberId = await client.getNumberId(contact.phoneId);
+
+            if (!numberId) {
+                console.warn(`El número ${contact.phoneDisplay} no está registrado en WhatsApp. Se omite.`);
+            } else {
+                registered.push(contact);
+            }
+        } catch (error) {
+            console.error(`Error al validar ${contact.phoneDisplay}:`, error.message);
+        }
+
+        if (validationDelayMs > 0) {
+            await delay(validationDelayMs);
+        }
+    }
+
+    return registered;
+}
+
+function resolveMessageTemplate() {
+    const candidates = [];
+
+    if (MESSAGE_FILE_ENV) {
+        candidates.push({ path: MESSAGE_FILE_ENV, isExplicit: true });
+    }
+
+    const defaultFile = path.resolve(process.cwd(), 'message.txt');
+    if (!MESSAGE_FILE_ENV || path.resolve(MESSAGE_FILE_ENV) !== defaultFile) {
+        candidates.push({ path: defaultFile, isExplicit: false });
+    }
+
+    for (const candidate of candidates) {
+        const absolutePath = path.resolve(candidate.path);
+
+        if (!fs.existsSync(absolutePath)) {
+            if (candidate.isExplicit) {
+                console.warn(`No se encontró el archivo de mensaje indicado (${absolutePath}). Se utilizará la plantilla predeterminada.`);
+            }
+            continue;
+        }
+
+        const content = fs.readFileSync(absolutePath, 'utf8').trim();
+
+        if (!content) {
+            console.warn(`El archivo de mensaje (${absolutePath}) está vacío. Se ignora.`);
+            continue;
+        }
+
+        return { content, source: absolutePath };
+    }
+
+    return null;
+}
+
 async function main() {
     const [,, excelPath, minDelayArg] = process.argv;
 
@@ -126,6 +194,15 @@ async function main() {
     }
 
     const minDelayMs = Number.parseInt(minDelayArg, 10) || DEFAULT_MIN_DELAY;
+
+    const templateFromFile = resolveMessageTemplate();
+
+    if (templateFromFile) {
+        messageTemplate = templateFromFile.content;
+        console.log(`Mensaje cargado desde ${templateFromFile.source}`);
+    } else {
+        console.log('Usando plantilla de mensaje predeterminada.');
+    }
 
     console.log(`Leyendo contactos desde ${excelPath}...`);
     const contacts = readContactsFromWorkbook(excelPath);
@@ -149,9 +226,21 @@ async function main() {
     });
 
     client.on('ready', async () => {
-        console.log('Cliente listo. Iniciando envío masivo...');
-        await sendBulkMessages(client, contacts, minDelayMs);
+        console.log('Cliente listo. Verificando números en WhatsApp...');
+        const registeredContacts = await filterRegisteredContacts(client, contacts, VALIDATION_DELAY);
+
+        console.log(`Contactos activos en WhatsApp: ${registeredContacts.length}`);
+
+        if (registeredContacts.length === 0) {
+            console.warn('No hay contactos activos para enviar mensajes.');
+            await client.destroy();
+            return;
+        }
+
+        console.log('Iniciando envío masivo...');
+        await sendBulkMessages(client, registeredContacts, minDelayMs);
         console.log('Proceso finalizado. Puedes cerrar la aplicación.');
+        await client.destroy();
     });
 
     client.on('auth_failure', msg => {
