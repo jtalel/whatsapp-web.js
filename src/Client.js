@@ -846,7 +846,6 @@ class Client extends EventEmitter {
      * Closes the client
      */
     async destroy() {
-        await this.pupBrowser.close();
         await this.authStrategy.destroy();
     }
 
@@ -859,14 +858,6 @@ class Client extends EventEmitter {
                 return window.Store.AppState.logout();
             }
         });
-        await this.pupBrowser.close();
-        
-        let maxDelay = 0;
-        while (this.pupBrowser.isConnected() && (maxDelay < 10)) { // waits a maximum of 1 second before calling the AuthStrategy
-            await new Promise(resolve => setTimeout(resolve, 100));
-            maxDelay++; 
-        }
-        
         await this.authStrategy.logout();
     }
 
