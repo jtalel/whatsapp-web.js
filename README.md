@@ -29,6 +29,7 @@ The library works by launching the WhatsApp Web browser application and managing
 * [WWebJS Discord][discord]
 * [GitHub][gitHub]
 * [npm][npm]
+* [Bulk sender workbook statuses](docs/bulk-sender.md)
 
 ## Installation
 
