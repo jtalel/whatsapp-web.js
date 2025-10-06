@@ -4,6 +4,46 @@ const XLSX = require('xlsx');
 
 const { Client, LocalAuth } = require('./index');
 
+const STATUS_COLUMN = 'whatsapp_status';
+const STATUS_MESSAGE_COLUMN = 'whatsapp_status_message';
+const STATUS_LAST_CHECKED_COLUMN = 'whatsapp_last_checked';
+
+const STATUS_VALUES = {
+    invalid: 'INVALID_NUMBER',
+    notRegistered: 'NOT_REGISTERED',
+    registered: 'REGISTERED'
+};
+
+const FORCE_REVALIDATE = String(process.env.BULK_FORCE_REVALIDATE || '').toLowerCase() === 'true';
+
+let workbookContext = null;
+
+process.on('exit', () => {
+    try {
+        workbookContext?.save();
+    } catch (error) {
+        console.error('No se pudo guardar el archivo actualizado:', error.message);
+    }
+});
+
+const SIGNAL_EXIT_CODES = {
+    SIGINT: 130,
+    SIGTERM: 143
+};
+
+function handleTermination(signal) {
+    try {
+        workbookContext?.save();
+    } catch (error) {
+        console.error('No se pudo guardar el archivo actualizado:', error.message);
+    } finally {
+        process.exit(SIGNAL_EXIT_CODES[signal] ?? 0);
+    }
+}
+
+process.on('SIGINT', () => handleTermination('SIGINT'));
+process.on('SIGTERM', () => handleTermination('SIGTERM'));
+
 const DEFAULT_MIN_DELAY = Number.parseInt(process.env.BULK_MIN_DELAY_MS, 10) || 5000;
 const VALIDATION_DELAY = Number.parseInt(process.env.BULK_VALIDATION_DELAY_MS, 10) || 2000;
 const MESSAGE_TEMPLATE_ENV = process.env.BULK_MESSAGE_TEMPLATE || 'Hola {name}, este es un mensaje automatizado.';
@@ -61,6 +101,114 @@ function normalizePhoneNumber(input) {
  * Loads contacts from an Excel file.
  * @param {string} workbookPath
  */
+function createWorkbookContext(workbookPath, workbook, sheetName) {
+    const sheet = workbook.Sheets[sheetName];
+
+    if (!sheet['!ref']) {
+        sheet['!ref'] = 'A1';
+    }
+
+    const range = XLSX.utils.decode_range(sheet['!ref']);
+    const headerRowIndex = range.s.r;
+    const columnIndexes = new Map();
+
+    for (let col = range.s.c; col <= range.e.c; col += 1) {
+        const headerAddress = XLSX.utils.encode_cell({ r: headerRowIndex, c: col });
+        const cell = sheet[headerAddress];
+        const headerValue = cell && cell.v !== undefined && cell.v !== null ? String(cell.v).trim() : '';
+
+        if (headerValue) {
+            columnIndexes.set(headerValue.toLowerCase(), col);
+        }
+    }
+
+    let workbookDirty = false;
+    const pendingUpdates = new Map();
+
+    function ensureColumn(columnName) {
+        const lower = columnName.toLowerCase();
+
+        if (columnIndexes.has(lower)) {
+            return columnIndexes.get(lower);
+        }
+
+        const newCol = range.e.c + 1;
+        range.e.c = newCol;
+
+        const headerAddress = XLSX.utils.encode_cell({ r: headerRowIndex, c: newCol });
+        sheet[headerAddress] = { t: 's', v: columnName };
+        sheet['!ref'] = XLSX.utils.encode_range(range);
+
+        columnIndexes.set(lower, newCol);
+        workbookDirty = true;
+
+        return newCol;
+    }
+
+    function setCellValue(rowNumber, columnIndex, value) {
+        const cellAddress = XLSX.utils.encode_cell({ r: rowNumber, c: columnIndex });
+
+        if (value === undefined || value === null || value === '') {
+            delete sheet[cellAddress];
+            return;
+        }
+
+        sheet[cellAddress] = { t: 's', v: value };
+    }
+
+    function queueStatus(rowNumber, status, message, timestamp) {
+        if (!rowNumber) {
+            return;
+        }
+
+        pendingUpdates.set(rowNumber, {
+            status,
+            message: message || '',
+            timestamp: timestamp || new Date().toISOString()
+        });
+    }
+
+    function flushPendingUpdates() {
+        if (pendingUpdates.size === 0) {
+            return;
+        }
+
+        const statusColumnIndex = ensureColumn(STATUS_COLUMN);
+        const messageColumnIndex = ensureColumn(STATUS_MESSAGE_COLUMN);
+        const lastCheckedColumnIndex = ensureColumn(STATUS_LAST_CHECKED_COLUMN);
+
+        for (const [rowNumber, update] of pendingUpdates.entries()) {
+            const zeroBasedRow = rowNumber - 1;
+
+            setCellValue(zeroBasedRow, statusColumnIndex, update.status);
+            setCellValue(zeroBasedRow, messageColumnIndex, update.message);
+            setCellValue(zeroBasedRow, lastCheckedColumnIndex, update.timestamp);
+        }
+
+        pendingUpdates.clear();
+        workbookDirty = true;
+    }
+
+    function save() {
+        flushPendingUpdates();
+
+        if (!workbookDirty) {
+            return;
+        }
+
+        XLSX.writeFile(workbook, workbookPath);
+        workbookDirty = false;
+    }
+
+    return {
+        queueStatus,
+        save,
+        sheet,
+        range,
+        getStatusColumnIndex: () => columnIndexes.get(STATUS_COLUMN.toLowerCase())
+    };
+}
+
 function readContactsFromWorkbook(workbookPath) {
     const absolutePath = path.resolve(workbookPath);
 
@@ -77,28 +225,48 @@ function readContactsFromWorkbook(workbookPath) {
 
     const sheet = workbook.Sheets[firstSheetName];
     const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+    const context = createWorkbookContext(absolutePath, workbook, firstSheetName);
 
-    return rows
+    const contacts = rows
         .map((row, index) => {
+            const rowNumber = (row.__rowNum__ ?? index + 1) + 1;
+
             const telefono = row.telefono ?? row.phone ?? row.Telefono ?? row.Phone;
             const nombre = row.nombre ?? row.name ?? row.Nombre ?? row.Name;
+            const rawStatus = typeof row[STATUS_COLUMN] === 'string' ? row[STATUS_COLUMN] : row[STATUS_COLUMN]?.toString?.();
+            const normalizedStatus = rawStatus ? rawStatus.trim().toUpperCase() : '';
+
+            if (!FORCE_REVALIDATE && normalizedStatus === STATUS_VALUES.invalid) {
+                console.warn(`Fila ${rowNumber}: Marcado previamente como número inválido. Se omite el contacto.`);
+                return null;
+            }
+
+            if (!FORCE_REVALIDATE && normalizedStatus === STATUS_VALUES.notRegistered) {
+                console.warn(`Fila ${rowNumber}: Marcado previamente como no registrado en WhatsApp. Se omite el contacto.`);
+                return null;
+            }
 
             const normalized = normalizePhoneNumber(telefono);
 
             if (!normalized) {
-                console.warn(`Fila ${index + 2}: Número inválido u omitido. Se omite el contacto.`);
+                console.warn(`Fila ${rowNumber}: Número inválido u omitido. Se omite el contacto.`);
+                context.queueStatus(rowNumber, STATUS_VALUES.invalid, 'Número inválido u omitido.');
                 return null;
             }
 
             const trimmedName = typeof nombre === 'string' ? nombre.trim() : '';
 
             return {
+                rowNumber,
+                needsValidation: FORCE_REVALIDATE || normalizedStatus !== STATUS_VALUES.registered,
                 phoneId: normalized.id,
                 phoneDisplay: normalized.display,
                 name: trimmedName || normalized.display
             };
         })
         .filter(Boolean);
+
+    return { contacts, context };
 }
 
 function buildMessage(contact) {
@@ -126,17 +294,24 @@ async function sendBulkMessages(client, contacts, minDelayMs) {
     }
 }
 
-async function filterRegisteredContacts(client, contacts, validationDelayMs) {
+async function filterRegisteredContacts(client, contacts, validationDelayMs, context) {
     const registered = [];
 
     for (const contact of contacts) {
         try {
-            const numberId = await client.getNumberId(contact.phoneId);
-
-            if (!numberId) {
-                console.warn(`El número ${contact.phoneDisplay} no está registrado en WhatsApp. Se omite.`);
-            } else {
+            if (!contact.needsValidation) {
                 registered.push(contact);
+                context.queueStatus(contact.rowNumber, STATUS_VALUES.registered, 'Validación omitida (resultado previo).');
+            } else {
+                const numberId = await client.getNumberId(contact.phoneId);
+
+                if (!numberId) {
+                    console.warn(`El número ${contact.phoneDisplay} no está registrado en WhatsApp. Se omite.`);
+                    context.queueStatus(contact.rowNumber, STATUS_VALUES.notRegistered, 'No está registrado en WhatsApp.');
+                } else {
+                    registered.push({ ...contact, needsValidation: false });
+                    context.queueStatus(contact.rowNumber, STATUS_VALUES.registered, 'Validado en WhatsApp.');
+                }
             }
         } catch (error) {
             console.error(`Error al validar ${contact.phoneDisplay}:`, error.message);
@@ -205,11 +380,17 @@ async function main() {
     }
 
     console.log(`Leyendo contactos desde ${excelPath}...`);
-    const contacts = readContactsFromWorkbook(excelPath);
+    const { contacts, context } = readContactsFromWorkbook(excelPath);
+    workbookContext = context;
     console.log(`Contactos válidos: ${contacts.length}`);
+
+    if (FORCE_REVALIDATE) {
+        console.log('La variable BULK_FORCE_REVALIDATE está activa. Todos los números serán revalidados en esta ejecución.');
+    }
 
     if (contacts.length === 0) {
         console.warn('No hay contactos válidos para procesar.');
+        context.save();
         process.exit(0);
     }
 
@@ -227,12 +408,13 @@ async function main() {
 
     client.on('ready', async () => {
         console.log('Cliente listo. Verificando números en WhatsApp...');
-        const registeredContacts = await filterRegisteredContacts(client, contacts, VALIDATION_DELAY);
+        const registeredContacts = await filterRegisteredContacts(client, contacts, VALIDATION_DELAY, context);
 
         console.log(`Contactos activos en WhatsApp: ${registeredContacts.length}`);
 
         if (registeredContacts.length === 0) {
             console.warn('No hay contactos activos para enviar mensajes.');
+            context.save();
             await client.destroy();
             return;
         }
@@ -240,11 +422,13 @@ async function main() {
         console.log('Iniciando envío masivo...');
         await sendBulkMessages(client, registeredContacts, minDelayMs);
         console.log('Proceso finalizado. Puedes cerrar la aplicación.');
+        context.save();
         await client.destroy();
     });
 
     client.on('auth_failure', msg => {
         console.error('Error de autenticación:', msg);
+        context.save();
     });
 
     client.initialize();
