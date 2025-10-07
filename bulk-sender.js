@@ -11,7 +11,8 @@ const STATUS_LAST_CHECKED_COLUMN = 'whatsapp_last_checked';
 const STATUS_VALUES = {
     invalid: 'INVALID_NUMBER',
     notRegistered: 'NOT_REGISTERED',
-    registered: 'REGISTERED'
+    registered: 'REGISTERED',
+    optOut: 'OPT_OUT'
 };
 
 const FORCE_REVALIDATE = String(process.env.BULK_FORCE_REVALIDATE || '').toLowerCase() === 'true';
@@ -48,6 +49,9 @@ const DEFAULT_MIN_DELAY = Number.parseInt(process.env.BULK_MIN_DELAY_MS, 10) || 
 const VALIDATION_DELAY = Number.parseInt(process.env.BULK_VALIDATION_DELAY_MS, 10) || 2000;
 const MESSAGE_TEMPLATE_ENV = process.env.BULK_MESSAGE_TEMPLATE || 'Hola {name}, este es un mensaje automatizado.';
 const MESSAGE_FILE_ENV = process.env.BULK_MESSAGE_FILE;
+const OPT_OUT_FILE_ENV = process.env.BULK_OPTOUT_FILE;
+const DEFAULT_OPT_OUT_FILE = 'optout.txt';
+const OPT_OUT_FILE_PATH = path.resolve(process.cwd(), OPT_OUT_FILE_ENV || DEFAULT_OPT_OUT_FILE);
 
 const VENEZUELA_COUNTRY_CODE = '58';
 const VENEZUELA_PREFIXES = ['412', '422', '416', '426', '414', '424'];
@@ -95,6 +99,91 @@ function normalizePhoneNumber(input) {
         id: `${normalized}@c.us`,
         display: normalized
     };
+}
+
+function normalizeOptOutEntry(input) {
+    const normalized = normalizePhoneNumber(input);
+
+    if (!normalized) {
+        return null;
+    }
+
+    return normalized.display;
+}
+
+function persistOptOutNumbers(filePath, numbersSet) {
+    const sorted = Array.from(numbersSet).sort();
+    const data = sorted.join('\n');
+    const content = sorted.length > 0 ? `${data}\n` : '';
+
+    fs.writeFileSync(filePath, content, 'utf8');
+}
+
+function loadOptOutNumbers(filePath) {
+    if (!fs.existsSync(filePath)) {
+        return new Set();
+    }
+
+    const rawEntries = fs.readFileSync(filePath, 'utf8')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean);
+
+    const normalizedNumbers = new Set();
+    let needsPersistence = false;
+
+    for (const entry of rawEntries) {
+        const normalized = normalizeOptOutEntry(entry);
+
+        if (!normalized) {
+            console.warn(`Entrada inválida en la lista de opt-out: "${entry}". Se ignorará.`);
+            needsPersistence = true;
+            continue;
+        }
+
+        normalizedNumbers.add(normalized);
+
+        if (normalized !== entry) {
+            needsPersistence = true;
+        }
+    }
+
+    if (needsPersistence) {
+        persistOptOutNumbers(filePath, normalizedNumbers);
+    }
+
+    return normalizedNumbers;
+}
+
+function applyOptOutUpdates(entries, optOutNumbers, filePath) {
+    if (!entries || entries.length === 0) {
+        return false;
+    }
+
+    let updated = false;
+
+    for (const entry of entries) {
+        const normalized = normalizeOptOutEntry(entry);
+
+        if (!normalized) {
+            console.warn(`No se pudo interpretar el número de opt-out "${entry}". Se ignora.`);
+            continue;
+        }
+
+        if (optOutNumbers.has(normalized)) {
+            continue;
+        }
+
+        optOutNumbers.add(normalized);
+        console.log(`Número ${normalized} añadido a la lista de opt-out.`);
+        updated = true;
+    }
+
+    if (updated) {
+        persistOptOutNumbers(filePath, optOutNumbers);
+    }
+
+    return updated;
 }
 
 /**
@@ -209,7 +298,7 @@ function createWorkbookContext(workbookPath, workbook, sheetName) {
     };
 }
 
-function readContactsFromWorkbook(workbookPath) {
+function readContactsFromWorkbook(workbookPath, optOutNumbers) {
     const absolutePath = path.resolve(workbookPath);
 
     if (!fs.existsSync(absolutePath)) {
@@ -226,6 +315,8 @@ function readContactsFromWorkbook(workbookPath) {
     const sheet = workbook.Sheets[firstSheetName];
     const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
     const context = createWorkbookContext(absolutePath, workbook, firstSheetName);
+
+    const optOutSet = optOutNumbers instanceof Set ? optOutNumbers : new Set();
 
     const contacts = rows
         .map((row, index) => {
@@ -246,11 +337,22 @@ function readContactsFromWorkbook(workbookPath) {
                 return null;
             }
 
+            if (normalizedStatus === STATUS_VALUES.optOut) {
+                console.warn(`Fila ${rowNumber}: Marcado previamente como opt-out. Se omite el contacto.`);
+                return null;
+            }
+
             const normalized = normalizePhoneNumber(telefono);
 
             if (!normalized) {
                 console.warn(`Fila ${rowNumber}: Número inválido u omitido. Se omite el contacto.`);
                 context.queueStatus(rowNumber, STATUS_VALUES.invalid, 'Número inválido u omitido.');
+                return null;
+            }
+
+            if (optOutSet.has(normalized.display)) {
+                console.warn(`Fila ${rowNumber}: Número en lista de opt-out. Se omite el contacto.`);
+                context.queueStatus(rowNumber, STATUS_VALUES.optOut, 'Número en lista de opt-out.');
                 return null;
             }
 
@@ -360,15 +462,91 @@ function resolveMessageTemplate() {
     return null;
 }
 
-async function main() {
-    const [,, excelPath, minDelayArg] = process.argv;
+function parseArguments(argv) {
+    const positional = [];
+    const optOutEntries = [];
 
-    if (!excelPath) {
-        console.error('Uso: node bulk-sender.js <ruta_excel> [delay_ms]');
+    for (let index = 0; index < argv.length; index += 1) {
+        const argument = argv[index];
+
+        if (argument === '--optout') {
+            const value = argv[index + 1];
+
+            if (value === undefined) {
+                throw new Error('Falta un número después de --optout.');
+            }
+
+            optOutEntries.push(value);
+            index += 1;
+            continue;
+        }
+
+        if (argument.startsWith('--optout=')) {
+            const value = argument.slice('--optout='.length);
+
+            if (!value) {
+                throw new Error('Falta un número después de --optout=.');
+            }
+
+            optOutEntries.push(value);
+            continue;
+        }
+
+        positional.push(argument);
+    }
+
+    return { positional, optOutEntries };
+}
+
+async function main() {
+    let parsedArguments;
+
+    try {
+        parsedArguments = parseArguments(process.argv.slice(2));
+    } catch (error) {
+        console.error(error.message);
+        console.error('Uso: node bulk-sender.js <ruta_excel> [delay_ms] [--optout <numero> ...]');
         process.exit(1);
     }
 
+    const { positional, optOutEntries } = parsedArguments;
+    const [excelPath, minDelayArg, ...extraPositionals] = positional;
+
+    const optOutNumbers = loadOptOutNumbers(OPT_OUT_FILE_PATH);
+    const optOutUpdated = applyOptOutUpdates(optOutEntries, optOutNumbers, OPT_OUT_FILE_PATH);
+
+    if (!excelPath) {
+        if (optOutEntries.length === 0) {
+            console.error('Uso: node bulk-sender.js <ruta_excel> [delay_ms] [--optout <numero> ...]');
+            process.exit(1);
+        }
+
+        if (optOutNumbers.size > 0) {
+            console.log(`Lista de opt-out cargada (${optOutNumbers.size} números) desde ${OPT_OUT_FILE_PATH}.`);
+        }
+
+        if (optOutUpdated) {
+            console.log('Actualización completada. No se procesó ningún archivo de Excel.');
+            process.exit(0);
+        }
+
+        console.warn('No se añadieron números válidos a la lista de opt-out.');
+        process.exit(1);
+    }
+
+    if (extraPositionals.length > 0) {
+        console.warn(`Argumentos posicionales adicionales ignorados: ${extraPositionals.join(', ')}`);
+    }
+
     const minDelayMs = Number.parseInt(minDelayArg, 10) || DEFAULT_MIN_DELAY;
+
+    if (optOutNumbers.size > 0) {
+        console.log(`Lista de opt-out cargada (${optOutNumbers.size} números) desde ${OPT_OUT_FILE_PATH}.`);
+    }
+
+    if (optOutEntries.length > 0 && !optOutUpdated) {
+        console.warn('No se añadieron números válidos a la lista de opt-out.');
+    }
 
     const templateFromFile = resolveMessageTemplate();
 
@@ -380,7 +558,7 @@ async function main() {
     }
 
     console.log(`Leyendo contactos desde ${excelPath}...`);
-    const { contacts, context } = readContactsFromWorkbook(excelPath);
+    const { contacts, context } = readContactsFromWorkbook(excelPath, optOutNumbers);
     workbookContext = context;
     console.log(`Contactos válidos: ${contacts.length}`);
 
