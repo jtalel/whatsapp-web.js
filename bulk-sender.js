@@ -512,8 +512,25 @@ async function main() {
     const { positional, optOutEntries } = parsedArguments;
     const [excelPath, minDelayArg, ...extraPositionals] = positional;
 
+    const optOutNumbers = loadOptOutNumbers(OPT_OUT_FILE_PATH);
+    const optOutUpdated = applyOptOutUpdates(optOutEntries, optOutNumbers, OPT_OUT_FILE_PATH);
+
     if (!excelPath) {
-        console.error('Uso: node bulk-sender.js <ruta_excel> [delay_ms] [--optout <numero> ...]');
+        if (optOutEntries.length === 0) {
+            console.error('Uso: node bulk-sender.js <ruta_excel> [delay_ms] [--optout <numero> ...]');
+            process.exit(1);
+        }
+
+        if (optOutNumbers.size > 0) {
+            console.log(`Lista de opt-out cargada (${optOutNumbers.size} números) desde ${OPT_OUT_FILE_PATH}.`);
+        }
+
+        if (optOutUpdated) {
+            console.log('Actualización completada. No se procesó ningún archivo de Excel.');
+            process.exit(0);
+        }
+
+        console.warn('No se añadieron números válidos a la lista de opt-out.');
         process.exit(1);
     }
 
@@ -522,9 +539,6 @@ async function main() {
     }
 
     const minDelayMs = Number.parseInt(minDelayArg, 10) || DEFAULT_MIN_DELAY;
-
-    const optOutNumbers = loadOptOutNumbers(OPT_OUT_FILE_PATH);
-    const optOutUpdated = applyOptOutUpdates(optOutEntries, optOutNumbers, OPT_OUT_FILE_PATH);
 
     if (optOutNumbers.size > 0) {
         console.log(`Lista de opt-out cargada (${optOutNumbers.size} números) desde ${OPT_OUT_FILE_PATH}.`);

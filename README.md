@@ -78,7 +78,8 @@ node bulk-sender.js ./ruta/al/archivo.xlsx 7000
 ```
 
 * El segundo argumento define el retraso mínimo en milisegundos entre mensajes (por defecto `5000`).
-* Usa la opción `--optout <numero>` para registrar manualmente números que no deben volver a recibir mensajes. Puedes repetir la opción varias veces y los números se guardarán en `optout.txt` (o en la ruta definida por `BULK_OPTOUT_FILE`). Ejemplo: `node bulk-sender.js contactos.xlsx --optout 4141234567 --optout 4247654321`.
+* Usa la opción `--optout <numero>` para registrar manualmente números que no deben volver a recibir mensajes. Puedes repetir la opción varias veces y los números se guardarán en `optout.txt` (o en la ruta definida por `BULK_OPTOUT_FILE`). Ejemplo durante un envío: `node bulk-sender.js contactos.xlsx --optout 4141234567 --optout 4247654321`.
+* También puedes añadir números sin procesar un Excel ejecutando solo la opción: `node bulk-sender.js --optout 4141234567`. El script actualizará el archivo de opt-out y terminará inmediatamente.
 * Variables de entorno disponibles:
   * `BULK_DEFAULT_COUNTRY_CODE`: Prefijo de país que se añadirá si el número no lo incluye.
   * `BULK_MESSAGE_TEMPLATE`: Plantilla de mensaje; admite los marcadores `{name}` y `{phone}`.

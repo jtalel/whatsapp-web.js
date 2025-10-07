@@ -17,6 +17,18 @@ El script `bulk-sender.js` añade columnas de estado para cada contacto cuando s
 
 Además se almacena un mensaje de contexto y una marca de tiempo ISO en las otras dos columnas.
 
+## ¿Cómo marco manualmente un opt-out?
+
+Ejecuta el script con la opción `--optout` y el número en formato venezolano sin símbolos (`4141234567`, `4247654321`, etc.). Puedes repetir la opción tantas veces como necesites y los valores se guardarán en `optout.txt` (o en la ruta definida por `BULK_OPTOUT_FILE`).
+
+```bash
+node bulk-sender.js --optout 4141234567
+# o durante un envío masivo
+node bulk-sender.js contactos.xlsx --optout 4141234567 --optout 4247654321
+```
+
+Cuando se ejecuta solo con `--optout`, el script actualiza el archivo y termina sin abrir el libro de Excel.
+
 ## ¿Qué ocurre en siguientes ejecuciones?
 
 * Si una fila está marcada como `INVALID_NUMBER` o `NOT_REGISTERED`, el script la omite automáticamente en ejecuciones futuras para evitar validar el mismo número una y otra vez.
