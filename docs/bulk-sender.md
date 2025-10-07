@@ -13,12 +13,14 @@ El script `bulk-sender.js` añade columnas de estado para cada contacto cuando s
 | `INVALID_NUMBER`          | El número no tiene el formato venezolano esperado o la fila no incluye número |
 | `NOT_REGISTERED`          | El número existe pero no está afiliado a WhatsApp                             |
 | `REGISTERED`              | El número se validó como activo en WhatsApp                                   |
+| `OPT_OUT`                 | El número fue marcado manualmente para no ser contactado                      |
 
 Además se almacena un mensaje de contexto y una marca de tiempo ISO en las otras dos columnas.
 
 ## ¿Qué ocurre en siguientes ejecuciones?
 
 * Si una fila está marcada como `INVALID_NUMBER` o `NOT_REGISTERED`, el script la omite automáticamente en ejecuciones futuras para evitar validar el mismo número una y otra vez.
+* Si una fila está marcada como `OPT_OUT`, nunca volverá a enviarse un mensaje a ese contacto aunque se active la revalidación forzada; el estado solo puede cambiarse editando el Excel manualmente.
 * Si una fila está marcada como `REGISTERED`, el script asume que sigue siendo válido y tampoco vuelve a consultar a WhatsApp. Añade la nota `"Validación omitida (resultado previo)."` en la columna de mensajes.
 * Si necesitas forzar la revalidación de todos los números, establece la variable de entorno `BULK_FORCE_REVALIDATE=true` antes de ejecutar el script.
 
