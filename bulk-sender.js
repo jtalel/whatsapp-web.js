@@ -594,11 +594,14 @@ async function filterRegisteredContacts(client, contacts, validationDelayMs, con
     const registered = [];
 
     for (const contact of contacts) {
+        let performedValidation = false;
+
         try {
             if (!contact.needsValidation) {
                 registered.push(contact);
                 context.queueStatus(contact.rowNumber, STATUS_VALUES.registered, 'Validación omitida (resultado previo).');
             } else {
+                performedValidation = true;
                 const numberId = await client.getNumberId(contact.phoneId);
 
                 if (!numberId) {
@@ -613,7 +616,7 @@ async function filterRegisteredContacts(client, contacts, validationDelayMs, con
             console.error(`Error al validar ${contact.phoneDisplay}:`, error.message);
         }
 
-        if (validationDelayMs > 0) {
+        if (performedValidation && validationDelayMs > 0) {
             await delay(validationDelayMs);
         }
     }
