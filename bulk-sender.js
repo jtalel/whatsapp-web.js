@@ -19,6 +19,16 @@ const FORCE_REVALIDATE = String(process.env.BULK_FORCE_REVALIDATE || '').toLower
 
 let workbookContext = null;
 
+const PROGRESS_FILE_PATH = path.resolve(process.cwd(), '.bulk-sender-progress.json');
+const PROGRESS_FILE_VERSION = 1;
+
+const MINUTES_PER_DAY = 24 * 60;
+const MS_PER_MINUTE = 60 * 1000;
+const MS_PER_HOUR = 60 * MS_PER_MINUTE;
+const VENEZUELA_UTC_OFFSET_MINUTES = -4 * 60;
+const VENEZUELA_WINDOW_START_MINUTE = 8 * 60;
+const VENEZUELA_WINDOW_END_MINUTE = 20 * 60;
+
 process.on('exit', () => {
     try {
         workbookContext?.save();
@@ -44,6 +54,172 @@ function handleTermination(signal) {
 
 process.on('SIGINT', () => handleTermination('SIGINT'));
 process.on('SIGTERM', () => handleTermination('SIGTERM'));
+
+function readProgressFile() {
+    if (!fs.existsSync(PROGRESS_FILE_PATH)) {
+        return { version: PROGRESS_FILE_VERSION, workbooks: {} };
+    }
+
+    try {
+        const raw = fs.readFileSync(PROGRESS_FILE_PATH, 'utf8');
+        const parsed = JSON.parse(raw);
+
+        if (!parsed || typeof parsed !== 'object') {
+            throw new Error('Formato inválido');
+        }
+
+        if (!parsed.workbooks || typeof parsed.workbooks !== 'object') {
+            return { version: PROGRESS_FILE_VERSION, workbooks: {} };
+        }
+
+        return { version: parsed.version || PROGRESS_FILE_VERSION, workbooks: parsed.workbooks };
+    } catch (error) {
+        console.warn('No se pudo leer el archivo de progreso. Se reiniciará el seguimiento.', error.message);
+        return { version: PROGRESS_FILE_VERSION, workbooks: {} };
+    }
+}
+
+function writeProgressFile(data) {
+    const payload = {
+        version: PROGRESS_FILE_VERSION,
+        workbooks: data && typeof data.workbooks === 'object' ? data.workbooks : {}
+    };
+
+    try {
+        fs.writeFileSync(PROGRESS_FILE_PATH, JSON.stringify(payload, null, 2), 'utf8');
+    } catch (error) {
+        console.warn('No se pudo escribir el archivo de progreso:', error.message);
+        throw error;
+    }
+}
+
+function createProgressTracker(workbookPath) {
+    const absolutePath = path.resolve(workbookPath);
+    const { workbooks } = readProgressFile();
+    const existing = workbooks?.[absolutePath]?.completedRows;
+    const completedRows = new Set(Array.isArray(existing) ? existing : []);
+
+    function persist() {
+        const current = readProgressFile();
+
+        if (!current.workbooks || typeof current.workbooks !== 'object') {
+            current.workbooks = {};
+        }
+
+        current.workbooks[absolutePath] = {
+            completedRows: Array.from(completedRows.values())
+        };
+
+        writeProgressFile(current);
+    }
+
+    function remove() {
+        const current = readProgressFile();
+
+        if (current.workbooks && current.workbooks[absolutePath]) {
+            delete current.workbooks[absolutePath];
+
+            if (Object.keys(current.workbooks).length === 0) {
+                try {
+                    fs.unlinkSync(PROGRESS_FILE_PATH);
+                    return;
+                } catch (error) {
+                    if (error.code !== 'ENOENT') {
+                        console.warn('No se pudo eliminar el archivo de progreso:', error.message);
+                    }
+                }
+            }
+
+            try {
+                writeProgressFile(current);
+            } catch (error) {
+                console.warn('No se pudo actualizar el archivo de progreso al limpiar los datos:', error.message);
+            }
+        }
+    }
+
+    return {
+        hasRow: rowNumber => completedRows.has(rowNumber),
+        markCompleted(rowNumber) {
+            if (rowNumber === undefined || rowNumber === null) {
+                return;
+            }
+
+            if (!completedRows.has(rowNumber)) {
+                completedRows.add(rowNumber);
+
+                try {
+                    persist();
+                } catch (error) {
+                    console.warn('No se pudo actualizar el archivo de progreso:', error.message);
+                }
+            }
+        },
+        clear() {
+            completedRows.clear();
+            remove();
+        },
+        size() {
+            return completedRows.size;
+        },
+        path: absolutePath
+    };
+}
+
+function getVenezuelanMinuteOfDay(date = new Date()) {
+    const absoluteMinutes = Math.floor(date.getTime() / MS_PER_MINUTE);
+    let localMinutes = absoluteMinutes + VENEZUELA_UTC_OFFSET_MINUTES;
+    localMinutes %= MINUTES_PER_DAY;
+
+    if (localMinutes < 0) {
+        localMinutes += MINUTES_PER_DAY;
+    }
+
+    return localMinutes;
+}
+
+function isWithinSendingWindow(date = new Date()) {
+    const minuteOfDay = getVenezuelanMinuteOfDay(date);
+    return minuteOfDay >= VENEZUELA_WINDOW_START_MINUTE && minuteOfDay < VENEZUELA_WINDOW_END_MINUTE;
+}
+
+function msUntilNextWindow(date = new Date()) {
+    const minuteOfDay = getVenezuelanMinuteOfDay(date);
+
+    if (minuteOfDay < VENEZUELA_WINDOW_START_MINUTE) {
+        return (VENEZUELA_WINDOW_START_MINUTE - minuteOfDay) * MS_PER_MINUTE;
+    }
+
+    if (minuteOfDay >= VENEZUELA_WINDOW_END_MINUTE) {
+        return ((MINUTES_PER_DAY - minuteOfDay) + VENEZUELA_WINDOW_START_MINUTE) * MS_PER_MINUTE;
+    }
+
+    return 0;
+}
+
+async function ensureWithinSendingWindow() {
+    while (!isWithinSendingWindow()) {
+        const waitMs = msUntilNextWindow();
+
+        if (waitMs <= 0) {
+            break;
+        }
+
+        const totalMinutes = Math.ceil(waitMs / MS_PER_MINUTE);
+        const hours = Math.floor(totalMinutes / 60);
+        const minutes = totalMinutes % 60;
+        const parts = [];
+
+        if (hours > 0) {
+            parts.push(`${hours}h`);
+        }
+
+        parts.push(`${minutes}m`);
+
+        console.log(`Fuera del horario permitido (08:00-20:00 VET). Reintentando en ${parts.join(' ')}.`);
+        await delay(waitMs);
+    }
+}
 
 const DEFAULT_MIN_DELAY = Number.parseInt(process.env.BULK_MIN_DELAY_MS, 10) || 5000;
 const VALIDATION_DELAY = Number.parseInt(process.env.BULK_VALIDATION_DELAY_MS, 10) || 2000;
@@ -381,19 +557,37 @@ async function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function sendBulkMessages(client, contacts, minDelayMs) {
-    for (const contact of contacts) {
+async function sendBulkMessages(client, contacts, minDelayMs, context, progressTracker) {
+    let allSent = true;
+
+    for (let index = 0; index < contacts.length; index += 1) {
+        const contact = contacts[index];
+
+        if (progressTracker?.hasRow(contact.rowNumber)) {
+            continue;
+        }
+
+        await ensureWithinSendingWindow();
+
         const message = buildMessage(contact);
 
         try {
             await client.sendMessage(contact.phoneId, message);
             console.log(`Mensaje enviado a ${contact.name} (${contact.phoneDisplay})`);
+            progressTracker?.markCompleted(contact.rowNumber);
+            context?.queueStatus(contact.rowNumber, STATUS_VALUES.registered, 'Mensaje enviado correctamente.');
         } catch (error) {
             console.error(`Error al enviar mensaje a ${contact.phoneDisplay}:`, error.message);
+            context?.queueStatus(contact.rowNumber, STATUS_VALUES.registered, `Error al enviar mensaje: ${error.message}`);
+            allSent = false;
         }
 
-        await delay(minDelayMs);
+        if (minDelayMs > 0 && index < contacts.length - 1) {
+            await delay(minDelayMs);
+        }
     }
+
+    return allSent;
 }
 
 async function filterRegisteredContacts(client, contacts, validationDelayMs, context) {
@@ -557,10 +751,19 @@ async function main() {
         console.log('Usando plantilla de mensaje predeterminada.');
     }
 
-    console.log(`Leyendo contactos desde ${excelPath}...`);
-    const { contacts, context } = readContactsFromWorkbook(excelPath, optOutNumbers);
+    const absoluteExcelPath = path.resolve(excelPath);
+    console.log(`Leyendo contactos desde ${absoluteExcelPath}...`);
+    const { contacts, context } = readContactsFromWorkbook(absoluteExcelPath, optOutNumbers);
     workbookContext = context;
     console.log(`Contactos válidos: ${contacts.length}`);
+
+    const progressTracker = createProgressTracker(absoluteExcelPath);
+    const pendingContacts = contacts.filter(contact => !progressTracker.hasRow(contact.rowNumber));
+    const alreadyCompleted = contacts.length - pendingContacts.length;
+
+    if (alreadyCompleted > 0) {
+        console.log(`Reanudando envío: se omitirán ${alreadyCompleted} contacto${alreadyCompleted === 1 ? '' : 's'} ya procesado${alreadyCompleted === 1 ? '' : 's'}.`);
+    }
 
     if (FORCE_REVALIDATE) {
         console.log('La variable BULK_FORCE_REVALIDATE está activa. Todos los números serán revalidados en esta ejecución.');
@@ -570,6 +773,17 @@ async function main() {
         console.warn('No hay contactos válidos para procesar.');
         context.save();
         process.exit(0);
+    }
+
+    if (pendingContacts.length === 0 && !FORCE_REVALIDATE) {
+        console.log('No hay contactos pendientes de envío. Si deseas reiniciar el proceso, elimina el archivo de progreso:');
+        console.log(`  ${PROGRESS_FILE_PATH}`);
+        context.save();
+        process.exit(0);
+    }
+
+    if (pendingContacts.length === 0 && FORCE_REVALIDATE) {
+        console.log('No hay contactos pendientes de envío, pero se continuará para revalidar todos los registros por BULK_FORCE_REVALIDATE.');
     }
 
     const client = new Client({
@@ -586,19 +800,35 @@ async function main() {
 
     client.on('ready', async () => {
         console.log('Cliente listo. Verificando números en WhatsApp...');
-        const registeredContacts = await filterRegisteredContacts(client, contacts, VALIDATION_DELAY, context);
+        const validationTargets = FORCE_REVALIDATE ? contacts : pendingContacts;
+        const registeredContacts = await filterRegisteredContacts(client, validationTargets, VALIDATION_DELAY, context);
 
         console.log(`Contactos activos en WhatsApp: ${registeredContacts.length}`);
 
-        if (registeredContacts.length === 0) {
-            console.warn('No hay contactos activos para enviar mensajes.');
+        const registeredPending = registeredContacts.filter(contact => !progressTracker.hasRow(contact.rowNumber));
+
+        if (registeredContacts.length !== registeredPending.length) {
+            console.log(`Contactos activos pendientes de envío: ${registeredPending.length}`);
+        }
+
+        if (registeredPending.length === 0) {
+            console.warn('No hay contactos activos pendientes para enviar mensajes.');
             context.save();
             await client.destroy();
             return;
         }
 
         console.log('Iniciando envío masivo...');
-        await sendBulkMessages(client, registeredContacts, minDelayMs);
+        const allSent = await sendBulkMessages(client, registeredPending, minDelayMs, context, progressTracker);
+
+        if (allSent) {
+            console.log('Todos los mensajes pendientes fueron enviados correctamente.');
+            console.log('Si deseas reiniciar el proceso desde el principio, elimina el archivo de progreso:');
+            console.log(`  ${PROGRESS_FILE_PATH}`);
+        } else {
+            console.warn('El proceso finalizó con algunos errores. Revisa el log para más detalles.');
+        }
+
         console.log('Proceso finalizado. Puedes cerrar la aplicación.');
         context.save();
         await client.destroy();
